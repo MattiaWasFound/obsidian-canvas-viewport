@@ -9,15 +9,22 @@ interface CameraPosition {
 interface CanvasViewportSettings {
     debugMode: boolean;
     useGlobalViewport: boolean;
+    silentMode: boolean;
 }
 
 const DEFAULT_SETTINGS: CanvasViewportSettings = {
     debugMode: false,
     useGlobalViewport: false,
+    silentMode: false,
 };
 
 // The Canvas API is internal/undocumented, so we describe just the bits we rely on.
 interface Canvas {
+    // Live viewport (what is on screen right now).
+    x: number;
+    y: number;
+    zoom: number;
+    // Target viewport (what the canvas eases toward each frame).
     tx: number;
     ty: number;
     tZoom: number;
@@ -109,7 +116,7 @@ export default class CanvasViewportPlugin extends Plugin {
                         const key = this.getViewportKey();
                         if (deleted) {
                             this.log(`viewport deleted for device: ${key}`);
-                            new Notice(`Canvas viewport deleted for ${key}`);
+                            if (!this.settings.silentMode) new Notice(`Canvas viewport deleted for ${key}`);
                         } else {
                             this.log(`No viewport found to delete for device: ${key}`);
                             new Notice('No saved viewport found');
@@ -264,35 +271,64 @@ export default class CanvasViewportPlugin extends Plugin {
             return;
         }
 
-        this.log('Current Position:', canvas.tx, canvas.ty, 'zoom', canvas.tZoom);
+        this.log('Current live position:', canvas.x, canvas.y, 'zoom', canvas.zoom);
+        this.log('Current target position:', canvas.tx, canvas.ty, 'zoom', canvas.tZoom);
         this.log('Target Position', position);
 
-        try {
-            // Apply on the next frame so the canvas' own layout pass has settled.
-            requestAnimationFrame(() => {
-                this.applyViewport(canvas, position);
-                this.log('Viewport changes applied successfully');
-                if (!silent) new Notice('Canvas viewport restored');
-            });
-        } catch (error) {
-            console.error('Failed to restore viewport:', error);
+        this.applyViewport(canvas, position, () => {
+            this.log('Viewport changes applied successfully');
+            if (!silent && !this.settings.silentMode) new Notice('Canvas viewport restored');
+        }, () => {
             if (!silent) new Notice('Failed to restore viewport');
-        }
+        });
 
         this.logGroupEnd();
     }
 
-    // Restores the viewport by writing the target transform fields directly. We
-    // save tx/ty/tZoom, so restoring them 1:1 guarantees a clean round-trip --
-    // unlike panTo, which centers on a point rather than setting the translation.
-    // markViewportChanged + requestFrame wakes the render loop, which animates the
-    // canvas from its current position to these targets.
-    private applyViewport(canvas: Canvas, position: CameraPosition) {
-        canvas.tx = position.tx;
-        canvas.ty = position.ty;
-        canvas.tZoom = position.tZoom;
-        canvas.markViewportChanged();
-        canvas.requestFrame();
+    // Smoothly moves the viewport to the saved position with our own tween.
+    //
+    // We can't use Obsidian's built-in viewport animation (just setting the
+    // tx/ty/tZoom targets): while it eases zoom it zooms about the screen center
+    // and re-derives tx/ty every frame, clobbering the pan we asked for -- so zoom
+    // round-trips but pan drifts. Instead we interpolate ourselves and write BOTH
+    // the live (x/y/zoom) and target (tx/ty/tZoom) fields each frame, leaving the
+    // canvas no animation of its own to recompute. Result: smooth glide, exact
+    // landing.
+    private applyViewport(
+        canvas: Canvas,
+        to: CameraPosition,
+        onDone: () => void,
+        onError: (error: unknown) => void,
+        durationMs = 250,
+    ) {
+        const from = { tx: canvas.x, ty: canvas.y, tZoom: canvas.zoom };
+        const start = performance.now();
+        const ease = (t: number) => 1 - Math.pow(1 - t, 3); // easeOutCubic
+
+        // requestAnimationFrame only schedules -- it never throws synchronously --
+        // so every frame's work (and its error handling) has to live inside the
+        // callback, not around the rAF call.
+        const step = (now: number) => {
+            try {
+                const t = Math.min((now - start) / durationMs, 1);
+                const k = ease(t);
+                canvas.x = canvas.tx = from.tx + (to.tx - from.tx) * k;
+                canvas.y = canvas.ty = from.ty + (to.ty - from.ty) * k;
+                canvas.zoom = canvas.tZoom = from.tZoom + (to.tZoom - from.tZoom) * k;
+                canvas.markViewportChanged();
+                canvas.requestFrame();
+                if (t < 1) {
+                    requestAnimationFrame(step);
+                } else {
+                    onDone();
+                }
+            } catch (error) {
+                console.error('Failed to restore viewport:', error);
+                onError(error);
+            }
+        };
+
+        requestAnimationFrame(step);
     }
 
     private async saveCurrentPosition(view: CanvasView) {
@@ -321,7 +357,7 @@ export default class CanvasViewportPlugin extends Plugin {
             });
 
             this.log('Saved position for:', viewportKey, position);
-            new Notice('Canvas viewport saved');
+            if (!this.settings.silentMode) new Notice('Canvas viewport saved');
         } catch (error) {
             console.error('Failed to save canvas viewport:', error);
             new Notice('Failed to save viewport');
@@ -436,15 +472,7 @@ class CanvasViewportSettingTab extends PluginSettingTab {
 
         containerEl.empty();
 
-        new Setting(containerEl)
-            .setName('Debug mode')
-            .setDesc('Enable debug logging in the console')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.debugMode)
-                .onChange(async (value) => {
-                    this.plugin.settings.debugMode = value;
-                    await this.plugin.saveSettings();
-                }));
+        new Setting(containerEl).setName('Viewport').setHeading();
 
         new Setting(containerEl)
             .setName('Global viewport')
@@ -453,6 +481,28 @@ class CanvasViewportSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.useGlobalViewport)
                 .onChange(async (value) => {
                     this.plugin.settings.useGlobalViewport = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Silent mode')
+            .setDesc('Suppress success notices for save, restore, and delete (errors are always shown)')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.silentMode)
+                .onChange(async (value) => {
+                    this.plugin.settings.silentMode = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl).setName('Advanced').setHeading();
+
+        new Setting(containerEl)
+            .setName('Debug mode')
+            .setDesc('Enable debug logging in the console')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.debugMode)
+                .onChange(async (value) => {
+                    this.plugin.settings.debugMode = value;
                     await this.plugin.saveSettings();
                 }));
     }
