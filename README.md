@@ -7,8 +7,11 @@ This plugin allows you to save and restore viewport positions in Obsidian Canvas
 ## Features
 - Save current viewport position (zoom level and pan position)
 - Automatically restore viewport position when opening a canvas
+- Works with multiple canvases open at once — each canvas restores its own viewport
 - (Optionally) Save different Canvas viewports for different devices
 - Syncs with Obsidian Sync (stores data in the canvas file)
+
+Compatible with the latest Obsidian (tested against 1.13.x; requires 1.5.7+).
 
 ## Usage
 1. Open a canvas
